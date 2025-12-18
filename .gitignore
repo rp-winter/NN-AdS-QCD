@@ -1,0 +1,23 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtualenvs / env
+env/
+venv/
+.venv/
+ENV/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
