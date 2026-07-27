@@ -11,7 +11,9 @@ import matplotlib.pyplot as plt
 from scipy.linalg import eigvals as scipy_eigvals
 import optuna
 
-num_iter = 15000
+n_trials = 100
+
+num_iter = 10000
 
 torch.backends.cudnn.enabled = False
 dtype = torch.float64
@@ -26,14 +28,14 @@ print("Using device: ", device)
 Nc = 3
 g5_sq = (12*np.pi**2)/Nc
 
-omega_a1 = torch.tensor([1.26, 1.64], device=device)  # in GeV
-omega_a2 = torch.tensor([1.32, 1.70], device=device)  # in GeV
-omega_rho = torch.tensor([0.77, 1.45, 1.57, 1.7, 1.9, 2.15], device=device)
-omega_f0 = torch.tensor([0.5, 0.98, 1.37, 1.5, 1.7, 1.83, 2.0, 2.15, 2.3, 2.4, 2.55], device=device)  # in GeV
+omega_a1 = torch.tensor([1.23, 1.655], device=device)  # in GeV
+omega_a2 = torch.tensor([1.3182, 1.706], device=device)  # in GeV
+omega_rho = torch.tensor([0.77526, 1.465, 1.72], device=device)
+omega_f0 = torch.tensor([0.475, 0.99, torch.nan, 1.522, 1.733, 1.982], device=device)  # in GeV
 omega_pi = torch.tensor([0.134, 1.3, 1.8], device=device)  # in GeV
 
-z_max = 10.0
-h = 0.1
+z_max = 15.0
+h = 0.15
 z_ini = h
 
 def V_k_fn(v_z, k1, k2):
@@ -173,13 +175,34 @@ def eigenvalues_square_fn(model_A, model_v,  k1, k2, theta, L, no_eigenvalues = 
 ################################################################################################################################
 
 # Mass loss
-def mass_loss_fn(model_A, model_v,  k1, k2, theta, L):
+def mass_loss_fn(model_A, model_v,  k1, k2, theta, L, train_data=(omega_rho, omega_a1, omega_a2, omega_f0)):
+    omega_rho, omega_a1, omega_a2, omega_f0 = train_data
 
-    mbyL_rho, mbyL_a1, mbyL_a2, mbyL_f0 = eigenvalues_square_fn(model_A, model_v, k1, k2, theta, L, (len(omega_rho), len(omega_a1), len(omega_a2), len(omega_f0), len(omega_pi)))
+    mbyL_rho, mbyL_a1, mbyL_a2, mbyL_f0 = eigenvalues_square_fn(model_A, model_v, k1, k2, theta, L, (len(omega_rho), len(omega_a1), len(omega_a2), len(omega_f0)))
+    
+    # remove None values from omega_f0, omega_rho, omega_a1, omega_a2 and corresponding mbyL_f0, mbyL_rho, mbyL_a1, mbyL_a2 values
+    mask_f0 = ~torch.isnan(omega_f0)
+    mask_rho = ~torch.isnan(omega_rho)
+    mask_a1 = ~torch.isnan(omega_a1)
+    mask_a2 = ~torch.isnan(omega_a2)
+
+
+    omega_f0 = omega_f0[mask_f0]
+    omega_rho = omega_rho[mask_rho]
+    omega_a1 = omega_a1[mask_a1]
+    omega_a2 = omega_a2[mask_a2]
+
+    mbyL_f0 = mbyL_f0[mask_f0]
+    mbyL_rho = mbyL_rho[mask_rho]
+    mbyL_a1 = mbyL_a1[mask_a1]
+    mbyL_a2 = mbyL_a2[mask_a2]
+
     rho_mass_loss = torch.abs(mbyL_rho - omega_rho**2)/omega_rho**2
     a1_mass_loss = torch.abs(mbyL_a1 - omega_a1**2)/omega_a1**2
     a2_mass_loss = torch.abs(mbyL_a2 - omega_a2**2)/omega_a2**2
     f0_mass_loss = torch.abs(mbyL_f0 - omega_f0**2)/omega_f0**2
+
+    f0_mass_loss[0] *= 0.1 # give less weight to the lightest f0 meson since its nature is not well established
 
     sum_loss = (rho_mass_loss.sum() + a1_mass_loss.sum() + a2_mass_loss.sum() + f0_mass_loss.sum()).detach()
 
@@ -216,12 +239,20 @@ def pot_dash_IR_loss_fn(model_A, model_v, k1, k2, theta, L): # potential should 
     V_dash_a2 = autograd.grad(V_a2, z, torch.ones_like(V_a2), create_graph=True)[0]
     return nn.ReLU()(-V_dash_rho).sum() + nn.ReLU()(-V_dash_a2).sum()
 
-def train_model(k1, k2):
+
+def train_model(k1, k2, train_data=(omega_rho, omega_a1, omega_a2, omega_f0), test_data=omega_pi):
+    omega_rho, omega_a1, omega_a2, omega_f0 = train_data
+    omega_pi = test_data
+
     k1 = nn.Parameter(torch.tensor(k1, device=device))
     k2 = nn.Parameter(torch.tensor(k2, device=device))
 
+    initial_k1 = copy.deepcopy(k1.item())
+    initial_k2 = copy.deepcopy(k2.item())
+
     l = nn.Parameter(torch.tensor(1.0, device=device))
 
+    print("Starting New Trial...")
     print("k initial: ", k1.item(), k2.item())
 
     theta = nn.Parameter(torch.tensor(0.0, device=device))
@@ -246,16 +277,15 @@ def train_model(k1, k2):
     de_loss_arr = []
     total_loss_arr = []
 
-    optimizer_net = torch.optim.Adam(list(model_A.parameters()) + list(model_v.parameters()), lr=5e-4)
+    optimizer_net = torch.optim.Adam(list(model_A.parameters()) + list(model_v.parameters()), lr=1e-3)
     optimizer_k = torch.optim.Adam([k1, k2, l, theta], lr=5e-2)
 
     scheduler_net = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_net, mode='min', factor=0.95, patience=100, min_lr=1e-8)
     scheduler_k = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_k, mode='min', factor=0.6, patience=200, min_lr=1e-5)
-
     pbar = tqdm(range(num_iter))
 
     for i in pbar:
-        L = torch.log(1 + l**2)
+        L = torch.log(np.e + l**2)
         optimizer_net.zero_grad()
         optimizer_k.zero_grad()
 
@@ -271,7 +301,7 @@ def train_model(k1, k2):
 
         #total_loss += de_loss
         
-        total_loss += pos_v_dash_loss_fn(model_v, theta, L)*10
+        total_loss += pos_v_dash_loss_fn(model_v, theta, L)*100
         total_loss += A_z_IR_loss_fn(model_A)
         total_loss += pot_dash_IR_loss_fn(model_A, model_v, k1, k2, theta, L)
 
@@ -335,7 +365,7 @@ def train_model(k1, k2):
 
     eigval_rho, eigval_a1, eigval_a2, eigval_f0 = eigenvalues_square_fn(best_model_A, best_model_v, best_k1, best_k2, best_theta, best_L, (len(omega_rho), len(omega_a1), len(omega_a2), len(omega_f0), len(omega_pi)))
 
-    dz = 0.1
+    dz = 0.02
     z = torch.arange(dz, z_max, dz, requires_grad=True, device=device)
 
     v_z = v_z_fn(z, best_model_v, best_theta, best_L)
@@ -357,6 +387,7 @@ def train_model(k1, k2):
     off_diag_elem_M1_plus = 1/dz**2 + omega_z[:-1]/(2*dz)
     off_diag_elem_M1_minus = 1/dz**2 - omega_z[1:]/(2*dz)
     M1 = torch.diag(diag_elem_M1) + torch.diag(off_diag_elem_M1_plus, diagonal=1) + torch.diag(off_diag_elem_M1_minus, diagonal=-1)
+    M1[-1, -1] += 1/h**2 + omega_z[-1]/(2*h) # Neumann BC at IR
 
     # making M2 matrix
     M2 = torch.diag(C_z)
@@ -366,6 +397,7 @@ def train_model(k1, k2):
     off_diag_elem_M3_plus = 1/dz**2 - dB1_dz[:-1]/(2*dz)
     off_diag_elem_M3_minus = 1/dz**2 + dB1_dz[1:]/(2*dz)
     M3 = torch.diag(diag_elem_M3) + torch.diag(off_diag_elem_M3_plus, diagonal=1) + torch.diag(off_diag_elem_M3_minus, diagonal=-1)
+    M3[-1, -1] += 1/h**2 - dB1_dz[-1]/(2*h) # Neumann BC IR
 
     M = torch.zeros((2*len(z), 2*len(z)), device=device)
     M[:len(z), :len(z)] = M1
@@ -386,11 +418,32 @@ def train_model(k1, k2):
     eigenvalues_pi = np.sort(eigenvalues_pi.real)
     eigenvalues_pi = eigenvalues_pi[:len(omega_pi)]/(best_L**2)
 
-    eigenloss = np.mean(np.abs(eigenvalues_pi - (omega_pi**2).cpu().numpy())/(omega_pi**2).cpu().numpy())
-    eigenloss += np.mean(np.abs(eigval_rho.cpu().detach().numpy() - (omega_rho**2).cpu().numpy())/(omega_rho**2).cpu().numpy())
-    eigenloss += np.mean(np.abs(eigval_a1.cpu().detach().numpy() - (omega_a1**2).cpu().numpy())/(omega_a1**2).cpu().numpy())
-    eigenloss += np.mean(np.abs(eigval_a2.cpu().detach().numpy() - (omega_a2**2).cpu().numpy())/(omega_a2**2).cpu().numpy())
-    eigenloss += np.mean(np.abs(eigval_f0.cpu().detach().numpy() - (omega_f0**2).cpu().numpy())/(omega_f0**2).cpu().numpy())
+    # remove nan values from omega's and corresponding eigenvalues
+    mask_pi = ~torch.isnan(omega_pi)
+    omega_pi = omega_pi[mask_pi]
+    eigenvalues_pi = eigenvalues_pi[mask_pi]
+
+    mask_f0 = ~torch.isnan(omega_f0)
+    omega_f0 = omega_f0[mask_f0]
+    eigval_f0 = eigval_f0[mask_f0]
+
+    mask_rho = ~torch.isnan(omega_rho)
+    omega_rho = omega_rho[mask_rho]
+    eigval_rho = eigval_rho[mask_rho]
+
+    mask_a1 = ~torch.isnan(omega_a1)
+    omega_a1 = omega_a1[mask_a1]
+    eigval_a1 = eigval_a1[mask_a1]
+
+    mask_a2 = ~torch.isnan(omega_a2)
+    omega_a2 = omega_a2[mask_a2]
+    eigval_a2 = eigval_a2[mask_a2]
+
+    test_loss = np.mean(np.abs(eigenvalues_pi - (omega_pi**2).cpu().numpy())/(omega_pi**2).cpu().numpy())
+    train_loss = np.mean(np.abs(eigval_rho.cpu().detach().numpy() - (omega_rho**2).cpu().numpy())/(omega_rho**2).cpu().numpy())
+    train_loss += np.mean(np.abs(eigval_a1.cpu().detach().numpy() - (omega_a1**2).cpu().numpy())/(omega_a1**2).cpu().numpy())
+    train_loss += np.mean(np.abs(eigval_a2.cpu().detach().numpy() - (omega_a2**2).cpu().numpy())/(omega_a2**2).cpu().numpy())
+    train_loss += np.mean(np.abs(eigval_f0.cpu().detach().numpy() - (omega_f0**2).cpu().numpy())/(omega_f0**2).cpu().numpy())
 
     model = []
 
@@ -401,34 +454,42 @@ def train_model(k1, k2):
     model.append(best_k2.item())
     model.append(best_L)
     model.append(best_theta.item())
+    model.append(initial_k1)
+    model.append(initial_k2)
 
-    return model, eigenloss
+    return model, train_loss, test_loss
 
 best_loss = float('inf')
 
 def objective(trial):
     global best_loss
     # Suggest values for k1 and k2
-    k1 = trial.suggest_float('k1', -15.0, 15.0)
-    k2 = trial.suggest_float('k2', -15.0, 15.0)
+    k1 = trial.suggest_float('k1', -20.0, 20.0)
+    k2 = trial.suggest_float('k2', -20.0, 20.0)
 
-    model, eigenloss = train_model(k1, k2)
+    model, train_loss, test_loss = train_model(k1, k2)
+
+    eigenloss = train_loss + test_loss
 
     if eigenloss < best_loss:
         best_loss = eigenloss
         # Save the best model
-        torch.save(model[0].state_dict(), 'saved/0/best_model_optuna_A.pt')
-        torch.save(model[1].state_dict(), 'saved/0/best_model_optuna_v.pt')
-        with open('saved/0/best_model_optuna_params.txt', 'w') as f:
+        torch.save(model[0].state_dict(), 'saved/hyperopt/best_model_optuna_A.pt')
+        torch.save(model[1].state_dict(), 'saved/hyperopt/best_model_optuna_v.pt')
+        with open('saved/hyperopt/best_model_optuna_params.txt', 'w') as f:
+            f.write(f'Train_Loss: {train_loss}\n')
             f.write(f'k1: {model[2]}\n')
             f.write(f'k2: {model[3]}\n')
             f.write(f'L: {model[4]}\n')
             f.write(f'theta: {model[5]}\n')
+            f.write(f'initial_k1: {model[6]}\n')
+            f.write(f'initial_k2: {model[7]}\n')
+            f.write(f'Test_Loss: {test_loss}\n')
 
     return eigenloss
 
 study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=100)
+study.optimize(objective, n_trials=n_trials)
 
 print("Best trial:")
 print(study.best_params)
@@ -437,11 +498,11 @@ print("Best Loss: ", study.best_value)
 # load the best model
 best_model_A = A_LinearNN().to(device)
 best_model_v = v_LinearNN().to(device)
-best_model_A.load_state_dict(torch.load('saved/0/best_model_optuna_A.pt', map_location=device))
-best_model_v.load_state_dict(torch.load('saved/0/best_model_optuna_v.pt', map_location=device))
+best_model_A.load_state_dict(torch.load('saved/hyperopt/best_model_optuna_A.pt', map_location=device))
+best_model_v.load_state_dict(torch.load('saved/hyperopt/best_model_optuna_v.pt', map_location=device))
 
 params = {}
-with open('saved/0/best_model_optuna_params.txt', 'r') as f:
+with open('saved/hyperopt/best_model_optuna_params.txt', 'r') as f:
     for line in f:
         key, value = line.strip().split(': ')
         params[key] = float(value)
@@ -449,8 +510,11 @@ best_k1 = params['k1']
 best_k2 = params['k2']
 best_L = params['L']
 best_theta = params['theta']
-
+initial_k1 = params['initial_k1']
+initial_k2 = params['initial_k2']
 best_theta = torch.tensor(best_theta, device=device)
+
+
 eigval_rho, eigval_a1, eigval_a2, eigval_f0 = eigenvalues_square_fn(best_model_A, best_model_v, best_k1, best_k2, best_theta, best_L, (len(omega_rho), len(omega_a1), len(omega_a2), len(omega_f0), len(omega_pi)))
 mass_rho = torch.sqrt(eigval_rho)
 mass_a1 = torch.sqrt(eigval_a1)
@@ -494,7 +558,7 @@ axs[3].set_ylabel("Mass of $a_2$ meson (GeV)")
 axs[3].legend()
 
 plt.tight_layout()
-plt.savefig('results/meson_masses.pdf')
+plt.savefig('results/hyperopt/meson_masses.pdf')
 plt.clf()
 #plt.show()
 
@@ -517,7 +581,7 @@ axs[1].set_ylabel("v(z)")
 axs[1].legend(["$v(z)$"])
 #axs[1].set_yscale('symlog')
 plt.tight_layout()
-plt.savefig('results/v_A_plots.pdf')
+plt.savefig('results/hyperopt/v_A_plots.pdf')
 plt.clf()
 #plt.show()
 
@@ -558,11 +622,11 @@ plt.xlabel("z (GeV$^{-1}$)")
 plt.ylabel("Potential V(z) (GeV$^2$)")
 plt.legend()
 plt.yscale('symlog')
-plt.savefig('results/phi_plot.pdf')
+plt.savefig('results/hyperopt/V_plot.pdf')
 plt.clf()
 #plt.show()
 
-dz = 0.1
+dz = 0.02
 z = torch.arange(dz, z_max, dz, requires_grad=True, device=device)
 
 v_z = v_z_fn(z, best_model_v, best_theta, best_L)
@@ -622,7 +686,18 @@ plt.xlabel("n")
 plt.ylabel("Mass of $\\pi$ meson (GeV)")
 plt.legend()
 #plt.show()
-plt.savefig('results/pi_masses.pdf')
+plt.savefig('results/hyperopt/pi_masses.pdf')
 plt.clf()
 
+trials = study.trials_dataframe()
+# write to csv file
+trials.to_csv('saved/hyperopt/optuna_trials.csv', index=False)
+# plot the k1, k2 values for each trial
+plt.figure(figsize=(8, 6))
+plt.scatter(trials['params_k1'], trials['params_k2'], c=trials['value'], cmap='viridis', marker='o')
+plt.colorbar(label='Loss')
+plt.xlabel('k1')
+plt.ylabel('k2')
+plt.savefig('results/hyperopt/k1_k2_scatter.pdf')
+plt.clf()
 print(eigenvalues_pi)
